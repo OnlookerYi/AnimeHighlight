@@ -1,0 +1,48 @@
+profiles:
+  empty: {}
+
+  default:
+    loud:
+      rms: 1.0
+
+  fitness:
+    mechanical:
+      motion_var: 1.2
+      motion_energy: 0.1
+
+  idol:
+    cheer:
+      rms: 1.0
+      energy_var: 0.6
+    intense:
+      motion_energy: 0.8
+
+  battle:
+    intense:
+      motion_energy: 1.0
+      motion_var: 0.6
+      rms: 0.4
+      voice: 0.3
+    flash:
+      motion_cut: 1.0
+
+  intense:
+    intense:
+      motion_energy: 1.0
+      motion_var: 0.6
+      rms: 0.8
+      energy_var: 0.5
+      voice: 0.5
+    flash:
+      motion_cut: 0.5
+
+  mechanical_loud:
+    mechanical:
+      jitter_local: 1.0
+      jitter_freq: 1.2
+      jitter_stable: 1.0
+      motion_energy: 0.2
+    shout:
+      rms: 1.0
+      energy_var: 0.6
+      voice: 0.8
