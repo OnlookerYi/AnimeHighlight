@@ -5,6 +5,7 @@ import argparse
 
 from audio import extract_audio_features
 from motion import extract_motion_features
+from color import extract_color_features
 from audio_patterns import detect_audio_patterns
 from motion_patterns import detect_motion_patterns
 from highlight_utils import find_highlights, cut_and_concat
@@ -18,7 +19,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # =======================
 
 def normalize_feature(x):
-    """特征级归一化到 [0, 1]"""
     x = np.asarray(x, dtype=float)
     mn, mx = x.min(), x.max()
     if mx - mn < 1e-6:
@@ -27,7 +27,6 @@ def normalize_feature(x):
 
 
 def normalize(x):
-    """结果级归一化（最终 score）"""
     return (x - x.min()) / (x.max() - x.min() + 1e-6)
 
 
@@ -65,6 +64,7 @@ def resolve_weights(profile_name, patterns, cfg, args):
         "jitter_freq": args.jitter_freq,
         "jitter_stability": args.jitter_stability,
         "oscillation": args.oscillation,
+        "user_color": args.user_color,   # ✅ 修复
     }
 
     for k, v in cli_map.items():
@@ -75,47 +75,52 @@ def resolve_weights(profile_name, patterns, cfg, args):
 
 
 # =======================
-# 长度对齐
+# 长度对齐（三路）
 # =======================
 
-def align_length(audio, motion):
-    if audio is None:
-        return motion, None
-    if motion is None:
-        return None, audio
+def align_length(audio, motion, color):
+    lengths = []
+    if audio is not None:
+        lengths.append(len(next(iter(audio.values()))))
+    if motion is not None:
+        lengths.append(len(next(iter(motion.values()))))
+    if color is not None:
+        lengths.append(len(next(iter(color.values()))))
 
-    try:
-        a_len = len(next(iter(audio.values())))
-        m_len = len(next(iter(motion.values())))
-    except StopIteration:
-        error("ALIGN", "audio 或 motion 特征为空")
-        return None, None
+    if not lengths:
+        error("ALIGN", "audio / motion / color 同时为空")
+        return None, None, None
 
-    min_len = min(a_len, m_len)
+    min_len = min(lengths)
 
-    def safe_truncate(feats):
-        out = {}
-        for k, v in feats.items():
-            if isinstance(v, np.ndarray):
-                out[k] = v[:min_len]
-            else:
-                out[k] = v
-        return out
+    def truncate(feats):
+        if feats is None:
+            return None
+        return {
+            k: v[:min_len] if isinstance(v, np.ndarray) else v
+            for k, v in feats.items()
+        }
 
-    return safe_truncate(audio), safe_truncate(motion)
+    return truncate(audio), truncate(motion), truncate(color)
 
 
 # =======================
-# Score Building（✅ 特征级归一化）
+# Score Building
 # =======================
 
-def build_raw_score(audio, motion, weights):
-    audio, motion = align_length(audio, motion)
-    if audio is None or motion is None:
-        error("SCORE", "特征对齐失败，无法计算 score")
+def build_raw_score(audio, motion, color, weights):
+    audio, motion, color = align_length(audio, motion, color)
+
+    if audio is not None:
+        length = len(next(iter(audio.values())))
+    elif motion is not None:
+        length = len(next(iter(motion.values())))
+    elif color is not None:
+        length = len(next(iter(color.values())))
+    else:
+        error("SCORE", "无可用特征，无法计算 score")
         return np.array([])
 
-    length = len(audio["rms"]) if audio is not None else len(motion["energy"])
     score = np.zeros(length)
 
     if audio is not None:
@@ -132,14 +137,18 @@ def build_raw_score(audio, motion, weights):
         score += weights.get("jitter_stability", 0) * normalize_feature(motion["jitter_stable"])
         score += weights.get("oscillation", 0) * normalize_feature(motion["oscillation"])
 
+    if color is not None:
+        for name in color:
+            score += weights.get(name, 0) * normalize_feature(color[name])
+
     return score
 
 
 # =======================
-# 调试导出（✅ 归一化前 / 后都导出）
+# Debug 导出
 # =======================
 
-def dump_debug_txt(score_raw, score_norm, audio, motion, video_path, out_dir="debug"):
+def dump_debug_txt(score_raw, score_norm, audio, motion, color, video_path, out_dir="debug"):
     os.makedirs(out_dir, exist_ok=True)
     name = os.path.splitext(os.path.basename(video_path))[0]
     path = os.path.join(out_dir, f"{name}_debug.txt")
@@ -151,29 +160,20 @@ def dump_debug_txt(score_raw, score_norm, audio, motion, video_path, out_dir="de
             return 0.0
         return float(normalize_feature(feats[key])[i])
 
-    # 时间转换：秒 → HH:MM:SS
     def fmt_time(sec):
         h, rem = divmod(int(sec), 3600)
         m, s = divmod(rem, 60)
         return f"{h:02d}:{m:02d}:{s:02d}"
 
-    # 列宽定义（左对齐）
     w = {
-        "sec": 10,
-        "rms": 12,
-        "energy_var": 14,
-        "voice_ratio": 14,
-        "motion_energy": 16,
-        "oscillation": 14,
-        "jitter_local": 16,
-        "jitter_freq": 14,
-        "jitter_stable": 16,
-        "score_raw": 12,
-        "score": 12,
+        "sec": 10, "rms": 12, "energy_var": 14, "voice_ratio": 14,
+        "motion_energy": 16, "oscillation": 14,
+        "jitter_local": 16, "jitter_freq": 14, "jitter_stable": 16,
+        "score_raw": 12, "score": 12,
     }
 
     with open(path, "w", encoding="utf-8") as f:
-        f.write(
+        header = (
             f"{'sec':<{w['sec']}}\t"
             f"{'rms':<{w['rms']}}\t"
             f"{'energy_var':<{w['energy_var']}}\t"
@@ -183,12 +183,17 @@ def dump_debug_txt(score_raw, score_norm, audio, motion, video_path, out_dir="de
             f"{'jitter_local':<{w['jitter_local']}}\t"
             f"{'jitter_freq':<{w['jitter_freq']}}\t"
             f"{'jitter_stable':<{w['jitter_stable']}}\t"
-            f"{'score_raw':<{w['score_raw']}}\t"
-            f"{'score':<{w['score']}}\n"
         )
 
+        if color is not None:
+            for k in color:
+                header += f"{k:<14}\t"
+
+        header += f"{'score_raw':<{w['score_raw']}}\t{'score':<{w['score']}}\n"
+        f.write(header)
+
         for i in range(length):
-            f.write(
+            line = (
                 f"{fmt_time(i):<{w['sec']}}\t"
                 f"{nf(audio, 'rms', i):<{w['rms']}.4f}\t"
                 f"{nf(audio, 'energy_var', i):<{w['energy_var']}.4f}\t"
@@ -198,22 +203,27 @@ def dump_debug_txt(score_raw, score_norm, audio, motion, video_path, out_dir="de
                 f"{nf(motion, 'jitter_local', i):<{w['jitter_local']}.4f}\t"
                 f"{nf(motion, 'jitter_freq', i):<{w['jitter_freq']}.4f}\t"
                 f"{nf(motion, 'jitter_stable', i):<{w['jitter_stable']}.4f}\t"
-                f"{score_raw[i]:<{w['score_raw']}.4f}\t"
-                f"{score_norm[i]:<{w['score']}.4f}\n"
             )
+
+            if color is not None:
+                for k in color:
+                    line += f"{nf(color, k, i):<14.4f}\t"
+
+            line += f"{score_raw[i]:<{w['score_raw']}.4f}\t{score_norm[i]:<{w['score']}.4f}\n"
+            f.write(line)
 
     info("DEBUG", f"已导出调试信息: {path}")
 
 
 # =======================
-# Pipeline
+# Pipeline（✅ 已修复）
 # =======================
 
 def run(video_path, args):
     info("RUN", f"video={video_path}")
-    info("RUN", f"audio_only={args.audio_only}, motion_only={args.motion_only}")
+    info("RUN", f"use_audio={args.use_audio}, use_motion={args.use_motion}, use_color={args.use_color}")
 
-    if args.output == "highlights.mp4":  # 默认值
+    if args.output == "highlights.mp4":
         src_name = os.path.splitext(os.path.basename(video_path))[0]
         args.output = f"HL-{src_name}.mp4"
 
@@ -222,23 +232,21 @@ def run(video_path, args):
         error("RUN", "配置为空，终止运行")
         return
 
-    use_audio = not args.motion_only
-    use_motion = not args.audio_only
+    use_audio = args.use_audio
+    use_motion = args.use_motion
+    use_color = args.use_color
 
-    if not use_audio and not use_motion:
-        error("RUN", "不能同时 audio_only 和 motion_only")
+    if not use_audio and not use_motion and not use_color:
+        error("RUN", "至少需要开启 audio / motion / color 之一")
         return
 
     audio = extract_audio_features(video_path) if use_audio else None
-    motion = None
-
-    if use_motion:
-        motion = extract_motion_features(
-            video_path,
-            sample_rate=args.sample_rate,
-            flow_scale=args.flow_scale,
-            mode=args.motion_mode
-        )
+    motion = extract_motion_features(
+        video_path,
+        sample_rate=args.sample_rate,
+        flow_scale=args.flow_scale,
+        mode=args.motion_mode
+    ) if use_motion else None
 
     ap = detect_audio_patterns(audio) if use_audio else []
     mp = detect_motion_patterns(motion) if use_motion else []
@@ -249,7 +257,29 @@ def run(video_path, args):
     weights = resolve_weights(args.profile, patterns, cfg, args)
     info("WEIGHT", f"final weights={weights}")
 
-    score_raw = build_raw_score(audio, motion, weights)
+    # ✅ 关键修复：color 必须在所有路径下定义
+    color = None
+
+    if use_color:
+        from colors.builder import build_all
+        all_colors = set(build_all().keys())
+
+        active_colors = {
+            k for k in weights
+            if k in all_colors and weights[k] > 0
+        }
+
+        if not active_colors:
+            warn("COLOR", "use_color 已开启，但未给任何色彩权重，跳过色彩")
+        else:
+            color = extract_color_features(
+                video_path,
+                sample_rate=args.sample_rate,
+                center_ratio=args.center_ratio,
+                active_colors=active_colors
+            )
+
+    score_raw = build_raw_score(audio, motion, color, weights)
     if score_raw.size == 0:
         error("RUN", "score 为空，无法生成高光")
         return
@@ -259,7 +289,7 @@ def run(video_path, args):
     if args.smooth > 1:
         score = np.convolve(score, np.ones(args.smooth) / args.smooth, mode="same")
 
-    dump_debug_txt(score_raw, score, audio, motion, video_path)
+    dump_debug_txt(score_raw, score, audio, motion, color, video_path)
 
     segs = find_highlights(
         score,
@@ -288,7 +318,7 @@ def main():
     p.add_argument("video")
     p.add_argument("-o", "--output", default="highlights.mp4")
     p.add_argument("--profile", default="default")
-    p.add_argument("--config", default=None, help="配置文件路径")
+    p.add_argument("--config", default=None)
 
     p.add_argument("--min", type=int, default=3)
     p.add_argument("--max", type=int, default=30)
@@ -305,14 +335,17 @@ def main():
     p.add_argument("--flow-scale", type=float, default=0.5)
     p.add_argument("--motion-mode", choices=["fast", "accurate"], default="fast")
 
-    p.add_argument("--audio-only", action="store_true")
-    p.add_argument("--motion-only", action="store_true")
+    p.add_argument("--use-audio", action="store_true")
+    p.add_argument("--use-motion", action="store_true")
+    p.add_argument("--use-color", action="store_true")
     p.add_argument("--keep-parts", action="store_true")
 
+    # Audio
     p.add_argument("--rms", type=float, default=0.0)
     p.add_argument("--energy-var", type=float, default=0.0)
     p.add_argument("--voice", type=float, default=0.0)
 
+    # Motion
     p.add_argument("--motion-energy", type=float, default=0.0)
     p.add_argument("--motion-var", type=float, default=0.0)
     p.add_argument("--motion-cut", type=float, default=0.0)
@@ -320,6 +353,13 @@ def main():
     p.add_argument("--jitter-freq", type=float, default=0.0)
     p.add_argument("--jitter-stability", type=float, default=0.0)
     p.add_argument("--oscillation", type=float, default=0.0)
+
+    # Color
+    p.add_argument("--milk-white", type=float, default=0.0)
+    p.add_argument("--dark-shadow", type=float, default=0.0)
+    p.add_argument("--boss-flash", type=float, default=0.0)
+    p.add_argument("--user-color", type=float, default=0.0)
+    p.add_argument("--center-ratio", type=float, default=0.6)
 
     args = p.parse_args()
     run(args.video, args)
